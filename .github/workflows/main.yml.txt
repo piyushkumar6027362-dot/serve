@@ -1,0 +1,113 @@
+name: run-bot
+on:
+  workflow_dispatch:
+  # Safety-net: agar bot kisi wajah se band ho jaye (crash / GitHub ne kill kiya) to ye naya run line me laga deta hai.
+  # Concurrency group ki wajah se ye tabhi shuru hota hai jab purana run khatam ho — dono ek saath nahi chalte.
+  schedule:
+    - cron: "*/20 * * * *"
+
+permissions:
+  contents: read
+  actions: write        # bot GitHub 6h limit se pehle khud naya run dispatch kar sake (GITHUB_TOKEN se)
+
+# cancel-in-progress: false  -> naya run PENDING rehta hai, chal rahe bot ko beech me kill nahi karta.
+# (Pehle true tha: naya run aate hi purana turant kat jata tha aur chalta ZIP job toot jata tha.)
+concurrency:
+  group: bot
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      # ffprobe sirf video details ke liye hai. apt-get ffmpeg 4 min leta tha -> static ffprobe (GitHub se ~10s) + cache.
+      - name: Restore ffprobe cache
+        id: ffcache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/ffbin
+          key: ffprobe-btbn-v2
+      - name: Download static ffprobe (cache miss par)
+        if: steps.ffcache.outputs.cache-hit != 'true'
+        id: ffdl
+        continue-on-error: true
+        timeout-minutes: 3
+        run: |
+          mkdir -p ~/ffbin
+          curl -fsSL --retry 3 --connect-timeout 15 --max-time 150 -o /tmp/ff.tar.xz \
+            https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz \
+            && tar -xJf /tmp/ff.tar.xz -C ~/ffbin --strip-components=2 --wildcards '*/bin/ffprobe' \
+            && test -f ~/ffbin/ffprobe \
+            && chmod +x ~/ffbin/ffprobe \
+            || { echo "ffprobe download fail - bot bina video-details ke chalega"; rm -rf ~/ffbin; exit 1; }
+          rm -f /tmp/ff.tar.xz
+      - name: Save ffprobe cache
+        if: steps.ffcache.outputs.cache-hit != 'true' && steps.ffdl.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ~/ffbin
+          key: ffprobe-btbn-v2
+      - name: Add ffprobe to PATH
+        continue-on-error: true
+        run: |
+          if [ -x "$HOME/ffbin/ffprobe" ]; then
+            echo "$HOME/ffbin" >> "$GITHUB_PATH"
+            "$HOME/ffbin/ffprobe" -version | head -1
+          else
+            echo "ffprobe nahi mila (bot phir bhi chalega)"
+          fi
+      - name: Start Cloudflare quick tunnel
+        run: |
+          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+          nohup ./cloudflared tunnel --url http://localhost:8000 > tunnel.log 2>&1 &
+          for i in $(seq 1 30); do
+            URL=$(grep -o 'https://[-a-z0-9]*\.trycloudflare\.com' tunnel.log | head -1)
+            [ -n "$URL" ] && break
+            sleep 2
+          done
+          [ -z "$URL" ] && { echo "Tunnel URL nahi mila"; cat tunnel.log; exit 1; }
+          echo "ORIGIN_URL=$URL" >> $GITHUB_ENV
+          # auto-restart scheduler ka clock: run start time (bot crash-restart par reset nahi hoga)
+          echo "RUN_STARTED_AT=$(date +%s)" >> $GITHUB_ENV
+      - name: Run bot (crash par same run me auto-restart)
+        run: |
+          set +e
+          for i in $(seq 1 20); do
+            python main.py
+            code=$?
+            if [ $code -eq 0 ]; then
+              echo "Bot gracefully band hua (handover / normal exit)."
+              exit 0
+            fi
+            echo "Bot crash (exit $code) — 5s me dobara chala raha hoon ($i/20)"
+            sleep 5
+          done
+          exit 1
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          STORAGE_CHANNEL: ${{ secrets.STORAGE_CHANNEL }}
+          SECRET_KEY: ${{ secrets.SECRET_KEY }}
+          ALLOWED_USERS: ${{ secrets.ALLOWED_USERS }}
+          FIREBASE_URL: ${{ secrets.FIREBASE_URL }}
+          BASE_URL: https://proud-moon-7329.ayushkum099766.workers.dev
+          PORT: "8000"
+          # ── auto-restart scheduler ──
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}          # optional: GITHUB_TOKEN se dispatch na ho to PAT (actions:write) daalo
+          RESTART_AFTER_MIN: "325"               # itne min baad handover shuru (timeout-minutes 350 se pehle)
+          HARD_EXIT_MIN: "343"                   # chal rahe ZIP job ko itne min tak khatam hone ka time
+          # ── speed settings (GitHub runner: 7GB RAM) ──
+          ZIP_WORKERS: "6"
+          ZIP_SEG_CHUNKS: "8"
+          PYRO_TRANSMISSIONS: "12"
